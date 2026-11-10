@@ -1,23 +1,21 @@
-name: the latest cloudflared test
+name: cloudflared test
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 17 * * *'
 
 concurrency:
   group: cloudflared-test
   cancel-in-progress: true
 
 env:
-  GH_TOKEN: ${{ secrets.GH_TOKEN }}
   TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
-  LOG_URL: ${{ secrets.LOG_URL }}
-  NODE_ID: ${{ github.repository }}
-  RUN_ID: ${{ github.run_id }}
 
 jobs:
   tunnel:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 260
 
     steps:
       # ---------- Get Latest Version ----------
@@ -40,8 +38,8 @@ jobs:
           path: ~/cloudflared
           key: cloudflared-${{ steps.versions.outputs.cloudflared }}
 
-      # ---------- Install & Start Cloudflare Tunnel ----------
-      - name: Install & Start Cloudflare Tunnel
+      # ---------- Start & Test Cloudflared ----------
+      - name: Start & Test Cloudflared
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -62,15 +60,6 @@ jobs:
           # Optimize network buffers
           sudo sysctl -w net.core.rmem_max=16777216
           sudo sysctl -w net.core.wmem_max=16777216
-          # Notify node online
-          if [ -n "${LOG_URL}" ] && [ -n "${GH_TOKEN}" ]; then
-            curl -fsS -X POST "${LOG_URL}/node/online" \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Content-Type: application/json" \
-              -d "{\"node\":\"${NODE_ID}\",\"run_id\":\"${RUN_ID}\"}" \
-              || echo "WARNING: Failed to notify (ignored)"
-          fi
           # Start Cloudflare Tunnel
-          ~/cloudflared/cloudflared tunnel \
-            --metrics 127.0.0.1:60123 \
-            run 2>&1 | tee ~/cloudflared.log
+          ~/cloudflared/cloudflared tunnel run 2>&1 \
+            | sed -u -E 's/([[:alnum:]_-]+\.)+[[:alnum:]_-]+/***/g'
