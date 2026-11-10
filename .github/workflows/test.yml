@@ -15,7 +15,7 @@ env:
   RUN_ID: ${{ github.run_id }}
 
 jobs:
-  gateway:
+  tunnel:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
