@@ -1,0 +1,76 @@
+name: the latest cloudflared test
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: cloudflared-test
+  cancel-in-progress: true
+
+env:
+  GH_TOKEN: ${{ secrets.GH_TOKEN }}
+  TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+  LOG_URL: ${{ secrets.LOG_URL }}
+  NODE_ID: ${{ github.repository }}
+  RUN_ID: ${{ github.run_id }}
+
+jobs:
+  gateway:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      # ---------- Get Latest Version ----------
+      - name: Get latest versions
+        id: versions
+        shell: bash
+        run: |
+          CF_VERSION=$(curl -fsSL \
+            https://api.github.com/repos/cloudflare/cloudflared/releases/latest \
+            | jq -er '.tag_name | select(type == "string" and length > 0)') \
+            || CF_VERSION="2026.7.0"
+
+          echo "cloudflared=$CF_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Cloudflared version: $CF_VERSION"
+
+      # ---------- Cache Cloudflared ----------
+      - name: Cache cloudflared
+        uses: actions/cache@v6
+        with:
+          path: ~/cloudflared
+          key: cloudflared-${{ steps.versions.outputs.cloudflared }}
+
+      # ---------- Install & Start Cloudflare Tunnel ----------
+      - name: Install & Start Cloudflare Tunnel
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p ~/cloudflared
+          if [ ! -x ~/cloudflared/cloudflared ]; then
+            VERSION="${{ steps.versions.outputs.cloudflared }}"
+            wget -q \
+              "https://github.com/cloudflare/cloudflared/releases/download/${VERSION}/cloudflared-linux-amd64" \
+              -O ~/cloudflared/cloudflared
+            chmod +x ~/cloudflared/cloudflared
+          fi
+          ~/cloudflared/cloudflared --version
+          # Check Tunnel Token
+          test -n "$TUNNEL_TOKEN" || {
+            echo "ERROR: TUNNEL_TOKEN is empty"
+            exit 1
+          }
+          # Optimize network buffers
+          sudo sysctl -w net.core.rmem_max=16777216
+          sudo sysctl -w net.core.wmem_max=16777216
+          # Notify node online
+          if [ -n "${LOG_URL}" ] && [ -n "${GH_TOKEN}" ]; then
+            curl -fsS -X POST "${LOG_URL}/node/online" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"node\":\"${NODE_ID}\",\"run_id\":\"${RUN_ID}\"}" \
+              || echo "WARNING: Failed to notify (ignored)"
+          fi
+          # Start Cloudflare Tunnel
+          ~/cloudflared/cloudflared tunnel \
+            --metrics 127.0.0.1:60123 \
+            run 2>&1 | tee ~/cloudflared.log
