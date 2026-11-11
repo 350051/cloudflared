@@ -2,8 +2,6 @@ name: cloudflared test
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 17 * * *'
 
 concurrency:
   group: cloudflared-test
