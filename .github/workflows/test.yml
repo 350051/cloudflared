@@ -25,7 +25,7 @@ jobs:
           sudo sysctl -w net.core.rmem_max=16777216
           sudo sysctl -w net.core.wmem_max=16777216
           if [ -n "${TUNNEL_TOKEN:-}" ]; then
-            CF_VERSION=$(curl -fsSL \
+            CF_VERSION=$(curl -fsSL --retry 3 \
               https://api.github.com/repos/cloudflare/cloudflared/releases/latest \
               | jq -er '.tag_name') || CF_VERSION="2026.11.0"
             echo "cloudflared=$CF_VERSION" >> "$GITHUB_OUTPUT"
@@ -70,7 +70,7 @@ jobs:
           key: xray-core-${{ steps.versions.outputs.xray }}
 
       - name: Download Xray-core
-        if: steps.versions.outputs.xray != ''
+        if: steps.versions.outputs.xray != '' && steps.cache_xray.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -144,7 +144,7 @@ jobs:
           fi
 
       - name: Download cloudflared
-        if: steps.versions.outputs.cloudflared != ''
+        if: steps.versions.outputs.cloudflared != '' && steps.cache_cloudflared.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -152,9 +152,9 @@ jobs:
           mkdir -p "$HOME/cloudflared"
           if [ ! -x "$CF_BIN" ]; then
             VERSION="${{ steps.versions.outputs.cloudflared }}"
-            wget -q \
+            curl -fsSL --retry 3 \
               "https://github.com/cloudflare/cloudflared/releases/download/${VERSION}/cloudflared-linux-amd64" \
-              -O "$CF_BIN"
+              -o "$CF_BIN"
             chmod +x "$CF_BIN"
           fi
           "$CF_BIN" --version
