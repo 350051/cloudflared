@@ -22,6 +22,8 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          sudo sysctl -w net.core.rmem_max=16777216
+          sudo sysctl -w net.core.wmem_max=16777216
           if [ -n "${TUNNEL_TOKEN:-}" ]; then
             CF_VERSION=$(curl -fsSL \
               https://api.github.com/repos/cloudflare/cloudflared/releases/latest \
@@ -51,43 +53,60 @@ jobs:
             echo "WARNING: Xray configuration unavailable. Skipping Xray."
           fi
 
-      - name: Cache cloudflared
+      - name: Restore cloudflared cache
+        id: cache_cloudflared
         if: steps.versions.outputs.cloudflared != ''
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: ~/cloudflared
           key: cloudflared-${{ steps.versions.outputs.cloudflared }}
 
-      - name: Cache Xray-core
+      - name: Restore Xray-core cache
+        id: cache_xray
         if: steps.versions.outputs.xray != ''
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: ~/xray-core/bin
           key: xray-core-${{ steps.versions.outputs.xray }}
 
-      - name: Download & Start
+      - name: Download Xray-core
+        if: steps.versions.outputs.xray != ''
         shell: bash
         run: |
           set -Eeuo pipefail
-          sudo sysctl -w net.core.rmem_max=16777216
-          sudo sysctl -w net.core.wmem_max=16777216
-          if [ -n "${{ steps.versions.outputs.xray }}" ]; then
+          XRAY_DIR="$HOME/xray-core"
+          XRAY_BIN="$XRAY_DIR/bin/xray"
+          mkdir -p "$XRAY_DIR/bin"
+          if [ ! -x "$XRAY_BIN" ]; then
+            VERSION="${{ steps.versions.outputs.xray }}"
+            curl -fsSL --retry 3 \
+              "https://github.com/XTLS/Xray-core/releases/download/${VERSION}/Xray-linux-64.zip" \
+              -o /tmp/xray-core.zip
+            unzip -oq /tmp/xray-core.zip -d "$XRAY_DIR/bin"
+            chmod +x "$XRAY_BIN"
+            rm -f /tmp/xray-core.zip
+          fi
+          "$XRAY_BIN" version
+
+      - name: Save Xray-core cache
+        if: steps.versions.outputs.xray != '' && steps.cache_xray.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/xray-core/bin
+          key: xray-core-${{ steps.versions.outputs.xray }}
+
+      - name: Configure & Start Xray-core
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ -z "${{ steps.versions.outputs.xray }}" ]; then
+            echo "Xray-core unavailable. Skipping."
+          else
             XRAY_DIR="$HOME/xray-core"
             XRAY_BIN="$XRAY_DIR/bin/xray"
             XRAY_CONFIG="$XRAY_DIR/config.json"
             XRAY_USER="$(id -un)"
             XRAY_GROUP="$(id -gn)"
-            mkdir -p "$XRAY_DIR/bin"
-            if [ ! -x "$XRAY_BIN" ]; then
-              VERSION="${{ steps.versions.outputs.xray }}"
-              curl -fsSL --retry 3 \
-                "https://github.com/XTLS/Xray-core/releases/download/${VERSION}/Xray-linux-64.zip" \
-                -o /tmp/xray-core.zip
-              unzip -oq /tmp/xray-core.zip -d "$XRAY_DIR/bin"
-              chmod +x "$XRAY_BIN"
-              rm -f /tmp/xray-core.zip
-            fi
-            "$XRAY_BIN" version
             cp "$RUNNER_TEMP/xray-config.json" "$XRAY_CONFIG"
             chmod 600 "$XRAY_CONFIG"
             if "$XRAY_BIN" run -test -config "$XRAY_CONFIG" > /dev/null 2>&1; then
@@ -109,28 +128,52 @@ jobs:
           WantedBy=multi-user.target
           EOF
               sudo systemctl daemon-reload
-              sudo systemctl start xray
-              sleep 2
-              if ! sudo systemctl is-active --quiet xray; then
+              if ! sudo systemctl start xray; then
                 echo "WARNING: Xray-core failed to start."
+                sudo journalctl -u xray -n 30 --no-pager
+              else
+                sleep 2
+                if ! sudo systemctl is-active --quiet xray; then
+                  echo "WARNING: Xray-core failed to start."
+                  sudo journalctl -u xray -n 30 --no-pager
+                fi
               fi
             else
               echo "WARNING: Xray configuration validation failed."
             fi
-          else
-            echo "Xray-core unavailable. Skipping."
           fi
-          if [ -n "${{ steps.versions.outputs.cloudflared }}" ]; then
+
+      - name: Download cloudflared
+        if: steps.versions.outputs.cloudflared != ''
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          CF_BIN="$HOME/cloudflared/cloudflared"
+          mkdir -p "$HOME/cloudflared"
+          if [ ! -x "$CF_BIN" ]; then
+            VERSION="${{ steps.versions.outputs.cloudflared }}"
+            wget -q \
+              "https://github.com/cloudflare/cloudflared/releases/download/${VERSION}/cloudflared-linux-amd64" \
+              -O "$CF_BIN"
+            chmod +x "$CF_BIN"
+          fi
+          "$CF_BIN" --version
+
+      - name: Save cloudflared cache
+        if: steps.versions.outputs.cloudflared != '' && steps.cache_cloudflared.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/cloudflared
+          key: cloudflared-${{ steps.versions.outputs.cloudflared }}
+
+      - name: Configure & Start cloudflared
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ -z "${{ steps.versions.outputs.cloudflared }}" ]; then
+            echo "Cloudflare Tunnel unavailable. Nothing to start."
+          else
             CF_BIN="$HOME/cloudflared/cloudflared"
-            mkdir -p "$HOME/cloudflared"
-            if [ ! -x "$CF_BIN" ]; then
-              VERSION="${{ steps.versions.outputs.cloudflared }}"
-              wget -q \
-                "https://github.com/cloudflare/cloudflared/releases/download/${VERSION}/cloudflared-linux-amd64" \
-                -O "$CF_BIN"
-              chmod +x "$CF_BIN"
-            fi
-            "$CF_BIN" --version
             sudo tee /etc/systemd/system/cloudflared.service > /dev/null <<EOF
           [Unit]
           Description=cloudflared
@@ -147,25 +190,12 @@ jobs:
           EOF
             sudo chmod 600 /etc/systemd/system/cloudflared.service
             sudo systemctl daemon-reload
-            sudo systemctl start cloudflared
-            if ! sudo systemctl is-active --quiet cloudflared; then
+            if ! sudo systemctl start cloudflared || \
+              ! sudo systemctl is-active --quiet cloudflared; then
               echo "WARNING: Cloudflare Tunnel failed to start."
               sudo journalctl -u cloudflared -n 30 --no-pager
               exit 1
             fi
-            echo "===== Xray Runtime Status ====="
-            sudo systemctl show xray \
-              -p ActiveState \
-              -p SubState \
-              -p MainPID \
-              -p NRestarts \
-              -p ExecStart
-            echo "===== Xray Process ====="
-            pgrep -a -x xray || true
-            echo "===== Xray Recent Logs ====="
-            sudo journalctl -u xray -n 30 --no-pager
             sudo journalctl -fu cloudflared \
               | sed -u -E 's/([[:alnum:]_-]+\.)+[[:alnum:]_-]+/***/g'
-          else
-            echo "Cloudflare Tunnel unavailable. Nothing to start."
           fi
