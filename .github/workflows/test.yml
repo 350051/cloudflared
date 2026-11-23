@@ -153,7 +153,18 @@ jobs:
               sudo journalctl -u cloudflared -n 30 --no-pager
               exit 1
             fi
-            sudo journalctl -fu cloudflared -u xray \
+            echo "===== Xray Runtime Status ====="
+            sudo systemctl show xray \
+              -p ActiveState \
+              -p SubState \
+              -p MainPID \
+              -p NRestarts \
+              -p ExecStart
+            echo "===== Xray Process ====="
+            pgrep -a -x xray || true
+            echo "===== Xray Recent Logs ====="
+            sudo journalctl -u xray -n 30 --no-pager
+            sudo journalctl -fu cloudflared \
               | sed -u -E 's/([[:alnum:]_-]+\.)+[[:alnum:]_-]+/***/g'
           else
             echo "Cloudflare Tunnel unavailable. Nothing to start."
