@@ -1,4 +1,3 @@
-
 name: cloudflared test
 
 on:
@@ -18,7 +17,6 @@ jobs:
     timeout-minutes: 260
 
     steps:
-      # ---------- Get Latest Versions ----------
       - name: Get latest versions
         id: versions
         shell: bash
@@ -53,7 +51,6 @@ jobs:
             echo "WARNING: Xray configuration unavailable. Skipping Xray."
           fi
 
-      # ---------- Cache cloudflared ----------
       - name: Cache cloudflared
         if: steps.versions.outputs.cloudflared != ''
         uses: actions/cache@v6
@@ -61,7 +58,6 @@ jobs:
           path: ~/cloudflared
           key: cloudflared-${{ steps.versions.outputs.cloudflared }}
 
-      # ---------- Cache Xray-core ----------
       - name: Cache Xray-core
         if: steps.versions.outputs.xray != ''
         uses: actions/cache@v6
@@ -69,59 +65,95 @@ jobs:
           path: ~/xray-core/bin
           key: xray-core-${{ steps.versions.outputs.xray }}
 
-      # ---------- Download & Start ----------
       - name: Download & Start
         shell: bash
         run: |
           set -Eeuo pipefail
-          # Configure UDP buffers
           sudo sysctl -w net.core.rmem_max=16777216
           sudo sysctl -w net.core.wmem_max=16777216
-          # Download and start cloudflared
+          if [ -n "${{ steps.versions.outputs.xray }}" ]; then
+            XRAY_DIR="$HOME/xray-core"
+            XRAY_BIN="$XRAY_DIR/bin/xray"
+            XRAY_CONFIG="$XRAY_DIR/config.json"
+            XRAY_USER="$(id -un)"
+            XRAY_GROUP="$(id -gn)"
+            mkdir -p "$XRAY_DIR/bin"
+            if [ ! -x "$XRAY_BIN" ]; then
+              VERSION="${{ steps.versions.outputs.xray }}"
+              curl -fsSL --retry 3 \
+                "https://github.com/XTLS/Xray-core/releases/download/${VERSION}/Xray-linux-64.zip" \
+                -o /tmp/xray-core.zip
+              unzip -oq /tmp/xray-core.zip -d "$XRAY_DIR/bin"
+              chmod +x "$XRAY_BIN"
+              rm -f /tmp/xray-core.zip
+            fi
+            "$XRAY_BIN" version
+            cp "$RUNNER_TEMP/xray-config.json" "$XRAY_CONFIG"
+            chmod 600 "$XRAY_CONFIG"
+            if "$XRAY_BIN" run -test -config "$XRAY_CONFIG" > /dev/null 2>&1; then
+              sudo tee /etc/systemd/system/xray.service > /dev/null <<EOF
+          [Unit]
+          Description=Xray Core
+          After=network.target
+          StartLimitIntervalSec=0
+          [Service]
+          Type=simple
+          User=$XRAY_USER
+          Group=$XRAY_GROUP
+          WorkingDirectory=$XRAY_DIR
+          Environment=XRAY_LOCATION_ASSET=$XRAY_DIR/bin
+          ExecStart=$XRAY_BIN run -config $XRAY_CONFIG
+          Restart=always
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+              sudo systemctl daemon-reload
+              sudo systemctl start xray
+              sleep 2
+              if ! sudo systemctl is-active --quiet xray; then
+                echo "WARNING: Xray-core failed to start."
+              fi
+            else
+              echo "WARNING: Xray configuration validation failed."
+            fi
+          else
+            echo "Xray-core unavailable. Skipping."
+          fi
           if [ -n "${{ steps.versions.outputs.cloudflared }}" ]; then
-            mkdir -p ~/cloudflared
-            if [ ! -x ~/cloudflared/cloudflared ]; then
+            CF_BIN="$HOME/cloudflared/cloudflared"
+            mkdir -p "$HOME/cloudflared"
+            if [ ! -x "$CF_BIN" ]; then
               VERSION="${{ steps.versions.outputs.cloudflared }}"
               wget -q \
                 "https://github.com/cloudflare/cloudflared/releases/download/${VERSION}/cloudflared-linux-amd64" \
-                -O ~/cloudflared/cloudflared
-              chmod +x ~/cloudflared/cloudflared
+                -O "$CF_BIN"
+              chmod +x "$CF_BIN"
             fi
-            ~/cloudflared/cloudflared --version
-          fi
-          if [ -n "${{ steps.versions.outputs.xray }}" ]; then
-            (
-              set -Eeuo pipefail
-              mkdir -p ~/xray-core/bin
-              if [ ! -x ~/xray-core/bin/xray ]; then
-                VERSION="${{ steps.versions.outputs.xray }}"
-                curl -fsSL --retry 3 \
-                  "https://github.com/XTLS/Xray-core/releases/download/${VERSION}/Xray-linux-64.zip" \
-                  -o /tmp/xray-core.zip
-                unzip -oq /tmp/xray-core.zip -d ~/xray-core/bin
-                chmod +x ~/xray-core/bin/xray
-                rm -f /tmp/xray-core.zip
-              fi
-              ~/xray-core/bin/xray version
-              if ~/xray-core/bin/xray run -test \
-                -config "$RUNNER_TEMP/xray-config.json"; then
-                ~/xray-core/bin/xray run \
-                  -config "$RUNNER_TEMP/xray-config.json" \
-                  > "$RUNNER_TEMP/xray.log" 2>&1 &
-                XRAY_PID=$!
-                sleep 2
-                if ! kill -0 "$XRAY_PID" 2>/dev/null; then
-                  echo "WARNING: Xray-core failed to start."
-                  tail -n 30 "$RUNNER_TEMP/xray.log"
-                fi
-              else
-                echo "WARNING: Xray configuration validation failed."
-              fi
-            ) || echo "WARNING: Xray-core failed. Continuing with Cloudflared."
-          fi
-          # Start Cloudflare Tunnel
-          if [ -n "${{ steps.versions.outputs.cloudflared }}" ]; then
-            ~/cloudflared/cloudflared tunnel run 2>&1 \
+            "$CF_BIN" --version
+            sudo tee /etc/systemd/system/cloudflared.service > /dev/null <<EOF
+          [Unit]
+          Description=cloudflared
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          TimeoutStartSec=15
+          Type=notify
+          ExecStart=$CF_BIN --no-autoupdate tunnel run --token $TUNNEL_TOKEN
+          Restart=on-failure
+          RestartSec=5s
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+            sudo chmod 600 /etc/systemd/system/cloudflared.service
+            sudo systemctl daemon-reload
+            sudo systemctl start cloudflared
+            if ! sudo systemctl is-active --quiet cloudflared; then
+              echo "WARNING: Cloudflare Tunnel failed to start."
+              sudo journalctl -u cloudflared -n 30 --no-pager
+              exit 1
+            fi
+            sudo journalctl -fu cloudflared -u xray \
               | sed -u -E 's/([[:alnum:]_-]+\.)+[[:alnum:]_-]+/***/g'
           else
             echo "Cloudflare Tunnel unavailable. Nothing to start."
