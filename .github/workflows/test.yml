@@ -21,7 +21,7 @@ jobs:
         id: versions
         shell: bash
         run: |
-          set -Eeuo pipefail
+          set -uo pipefail
           sudo sysctl -w net.core.rmem_max=16777216
           sudo sysctl -w net.core.wmem_max=16777216
           if [ -n "${TUNNEL_TOKEN:-}" ]; then
@@ -36,10 +36,86 @@ jobs:
           if [ -n "${ACCESS_TOKEN:-}" ] && \
             curl -fsSL --retry 3 \
               -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-              "https://warp-config.heatdeath.workers.dev/config" \
+              "https://xray-config.heatdeath.workers.dev/config" \
               -o "$RUNNER_TEMP/xray-config.json" && \
-            jq -e 'type == "object"' \
+            jq -e 'type == "object" and
+              any(.outbounds[]; .tag == "warp")' \
               "$RUNNER_TEMP/xray-config.json" > /dev/null; then
+            echo "Base configuration downloaded."
+            echo "Installing wireguard-tools..."
+            if sudo apt-get update -qq && sudo apt-get install -y -qq wireguard-tools; then
+              echo "Generating WireGuard keys..."
+              PRIVATE_KEY=$(wg genkey)
+              PUBLIC_KEY=$(printf '%s' "$PRIVATE_KEY" | wg pubkey)
+              echo "Registering WARP..."
+              if INFO=$(curl -fsSL --retry 3 --max-time 30 \
+                -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+                -H "CF-Client-Version: a-7.21-0721" \
+                -H "Content-Type: application/json" \
+                -H "User-Agent: okhttp/3.12.1" \
+                -H "Accept: */*" \
+                -d "$(jq -n \
+                  --arg key "$PUBLIC_KEY" \
+                  --arg tos "$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")" \
+                  '{key:$key,tos:$tos}')"); then
+                if jq -e '
+                  .config.interface.addresses.v4 and
+                  .config.interface.addresses.v6 and
+                  .config.peers[0].public_key and
+                  .config.peers[0].endpoint.v4 and
+                  .config.client_id
+                ' <<< "$INFO" > /dev/null; then
+                  echo "Generating reserved data..."
+                  CLIENT_ID=$(jq -er '.config.client_id' <<< "$INFO")
+                  RESERVED="[$(printf '%s' "$CLIENT_ID" \
+                    | base64 -d | od -An -v -tu1 | xargs | tr ' ' ',')]"
+                  echo "Merging WARP configuration..."
+                  if jq --arg priv "$PRIVATE_KEY" \
+                    --argjson info "$INFO" \
+                    --argjson reserved "$RESERVED" '
+                    (.outbounds[] | select(.tag == "warp")) = {
+                      protocol: "wireguard",
+                      settings: {
+                        secretKey: $priv,
+                        address: [
+                          $info.config.interface.addresses.v4 + "/32",
+                          $info.config.interface.addresses.v6 + "/128"
+                        ],
+                        peers: [{
+                          publicKey: $info.config.peers[0].public_key,
+                          allowedIPs: ["0.0.0.0/0", "::/0"],
+                          endpoint: (
+                            $info.config.peers[0].endpoint.v4 |
+                            if endswith(":0") then .[:-2] + ":2408"
+                            else .
+                            end
+                          ),
+                          keepAlive: 25
+                        }],
+                        reserved: $reserved,
+                        mtu: 1420,
+                        domainStrategy: "ForceIP",
+                        noKernelTun: true
+                      },
+                      tag: "warp"
+                    }' "$RUNNER_TEMP/xray-config.json" \
+                    > "$RUNNER_TEMP/xray-config.tmp" && \
+                    mv "$RUNNER_TEMP/xray-config.tmp" \
+                      "$RUNNER_TEMP/xray-config.json"; then
+                    chmod 600 "$RUNNER_TEMP/xray-config.json"
+                    echo "WARP registration and configuration completed."
+                  else
+                    echo "WARNING: WARP configuration merge failed. Using base configuration."
+                  fi
+                else
+                  echo "WARNING: Invalid WARP registration response. Using base configuration."
+                fi
+              else
+                echo "WARNING: WARP registration failed. Using base configuration."
+              fi
+            else
+              echo "WARNING: Failed to install wireguard-tools. Skipping WARP."
+            fi
             XRAY_VERSION=$(curl -fsSL --retry 3 \
               https://api.github.com/repos/XTLS/Xray-core/releases/latest \
               | jq -er '.tag_name') || XRAY_VERSION=""
