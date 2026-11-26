@@ -24,10 +24,14 @@ jobs:
           set -Eeuo pipefail
           sudo sysctl -w net.core.rmem_max=16777216
           sudo sysctl -w net.core.wmem_max=16777216
+          get_latest_version() {
+            curl -fsSL --retry 3 -o /dev/null -w '%{url_effective}' "$1" \
+              | sed -nE 's#^.*/tag/([^/?]+).*#\1#p'
+          }
           if [ -n "${TUNNEL_TOKEN:-}" ]; then
-            CF_VERSION=$(curl -fsSL --retry 3 \
-              https://api.github.com/repos/cloudflare/cloudflared/releases/latest \
-              | jq -er '.tag_name') || CF_VERSION="2026.11.0"
+            CF_VERSION=$(get_latest_version \
+              "https://github.com/cloudflare/cloudflared/releases/latest") \
+              || CF_VERSION="2026.11.0"
             echo "cloudflared=$CF_VERSION" >> "$GITHUB_OUTPUT"
             echo "Cloudflared: $CF_VERSION"
           else
@@ -42,15 +46,11 @@ jobs:
               -o "$RUNNER_TEMP/xray-config.json" && \
             jq -e 'type == "object"' \
               "$RUNNER_TEMP/xray-config.json" > /dev/null; then
-            XRAY_VERSION=$(curl -fsSL --retry 3 \
-              https://api.github.com/repos/XTLS/Xray-core/releases/latest \
-              | jq -er '.tag_name') || XRAY_VERSION=""
-            if [ -n "$XRAY_VERSION" ]; then
-              echo "xray=$XRAY_VERSION" >> "$GITHUB_OUTPUT"
-              echo "Xray-core: $XRAY_VERSION"
-            else
-              echo "WARNING: Failed to get Xray version. Skipping Xray."
-            fi
+            XRAY_VERSION=$(get_latest_version \
+              "https://github.com/XTLS/Xray-core/releases/latest") \
+              || XRAY_VERSION="v26.11.9"
+            echo "xray=$XRAY_VERSION" >> "$GITHUB_OUTPUT"
+            echo "Xray-core: $XRAY_VERSION"
           else
             echo "WARNING: Xray configuration unavailable. Skipping Xray."
           fi
